@@ -1,1 +1,0 @@
-/usr/bin/cc  -Wall -Wextra -Wl,--dependency-file=CMakeFiles/methaur.dir/link.d CMakeFiles/methaur.dir/src/methaur.c.o -o methaur  /usr/lib/libcurl.so -ljson-c

@@ -1,8 +1,0 @@
-/home/astolfo/Desktop/methaur/build/CMakeFiles/methaur.dir
-/home/astolfo/Desktop/methaur/build/CMakeFiles/uninstall.dir
-/home/astolfo/Desktop/methaur/build/CMakeFiles/edit_cache.dir
-/home/astolfo/Desktop/methaur/build/CMakeFiles/rebuild_cache.dir
-/home/astolfo/Desktop/methaur/build/CMakeFiles/list_install_components.dir
-/home/astolfo/Desktop/methaur/build/CMakeFiles/install.dir
-/home/astolfo/Desktop/methaur/build/CMakeFiles/install/local.dir
-/home/astolfo/Desktop/methaur/build/CMakeFiles/install/strip.dir
