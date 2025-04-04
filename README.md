@@ -26,7 +26,7 @@ A lightweight, C-based AUR helper for Arch Linux, inspired by yay.
 1. Clone the repository:
 ```bash
 git clone https://github.com/kaygup/methaur.git
-cd methaur
+cd MethAUR
 ```
 2. build and install:
 ```bash
