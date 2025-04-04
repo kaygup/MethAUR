@@ -1,4 +1,4 @@
-# Maintainer: Your Name <your.email@example.com>
+# Maintainer: kaygup
 
 pkgname=methaur
 pkgver=0.1.0
