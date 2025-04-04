@@ -14,7 +14,6 @@
 #define ARCH_SEARCH_URL "https://archlinux.org/packages/search/json/?q="
 #define TMP_DIR "/tmp/methaur/"
 
-// Structure to hold package information
 typedef struct {
     char *name;
     char *version;
@@ -22,16 +21,14 @@ typedef struct {
     int votes;
     char *maintainer;
     char *url;
-    char *repo;      // Added to identify the repository (core, extra, aur)
+    char *repo;      
 } Package;
 
-// Structure for curl data
 typedef struct {
     char *data;
     size_t size;
 } CurlData;
 
-// Function declarations
 static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp);
 void search_aur(const char *query, Package **results, int *count);
 void search_arch_repos(const char *query, Package **results, int *count);
@@ -45,12 +42,10 @@ void create_directories();
 void print_usage();
 char *safe_strdup(const char *str);
 
-// Safe string duplication (handles NULL)
 char *safe_strdup(const char *str) {
     return str ? strdup(str) : strdup("");
 }
 
-// Callback function for curl
 static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t real_size = size * nmemb;
     CurlData *mem = (CurlData *)userp;
@@ -71,7 +66,6 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, void *us
     return real_size;
 }
 
-// Initialize curl data structure
 CurlData* init_curl_data() {
     CurlData* chunk = malloc(sizeof(CurlData));
     if (!chunk) return NULL;
@@ -87,7 +81,6 @@ CurlData* init_curl_data() {
     return chunk;
 }
 
-// Search AUR for packages
 void search_aur(const char *query, Package **results, int *count) {
     CURL *curl;
     CURLcode res;
@@ -197,7 +190,7 @@ void search_aur(const char *query, Package **results, int *count) {
     free(chunk);
 }
 
-// Search Arch repositories (core, extra, etc.)
+// Search Arch repos
 void search_arch_repos(const char *query, Package **results, int *count) {
     CURL *curl;
     CURLcode res;
@@ -306,20 +299,16 @@ void search_arch_repos(const char *query, Package **results, int *count) {
     free(chunk);
 }
 
-// Search packages in both AUR and Arch repos
 void search_packages(const char *query, Package **results, int *count) {
     Package *aur_results = NULL;
     Package *arch_results = NULL;
     int aur_count = 0;
     int arch_count = 0;
     
-    // Search in Arch repositories
     search_arch_repos(query, &arch_results, &arch_count);
     
-    // Search in AUR
     search_aur(query, &aur_results, &aur_count);
     
-    // Combine results
     int total_count = aur_count + arch_count;
     if (total_count == 0) {
         *count = 0;
@@ -340,7 +329,6 @@ void search_packages(const char *query, Package **results, int *count) {
         return;
     }
     
-    // Copy Arch results first (prioritize official repositories)
     int result_index = 0;
     for (int i = 0; i < arch_count && result_index < total_count; i++) {
         (*results)[result_index].name = safe_strdup(arch_results[i].name);
@@ -353,7 +341,6 @@ void search_packages(const char *query, Package **results, int *count) {
         result_index++;
     }
     
-    // Then copy AUR results
     for (int i = 0; i < aur_count && result_index < total_count; i++) {
         (*results)[result_index].name = safe_strdup(aur_results[i].name);
         (*results)[result_index].version = safe_strdup(aur_results[i].version);
@@ -367,12 +354,10 @@ void search_packages(const char *query, Package **results, int *count) {
     
     *count = result_index;
     
-    // Free temporary results
     free_package_data(aur_results, aur_count);
     free_package_data(arch_results, arch_count);
 }
 
-// Display search results
 void display_search_results(Package *results, int count) {
     if (results == NULL || count <= 0) {
         printf("No results to display.\n");
@@ -396,14 +381,12 @@ void display_search_results(Package *results, int count) {
     printf("\n");
 }
 
-// Create necessary directories
 void create_directories() {
     char command[MAX_BUFFER];
     snprintf(command, MAX_BUFFER, "mkdir -p %s", TMP_DIR);
     system(command);
 }
 
-// Download and build package
 int download_and_build_package(const char *package_name) {
     if (package_name == NULL || strlen(package_name) == 0) {
         fprintf(stderr, "Error: Invalid package name\n");
@@ -413,7 +396,6 @@ int download_and_build_package(const char *package_name) {
     char command[MAX_BUFFER];
     int status;
     
-    // Get into temp directory
     if (chdir(TMP_DIR) != 0) {
         fprintf(stderr, "Error: Failed to change to directory %s\n", TMP_DIR);
         return 1;
@@ -463,11 +445,9 @@ int install_package(const char *package_name, const char *repo) {
     
     printf("Installing %s from %s...\n", package_name, repo);
     
-    // If it's from AUR, use the AUR method
     if (strcmp(repo, "aur") == 0) {
         return download_and_build_package(package_name);
     } else {
-        // Check for sudo
         if (system("which sudo > /dev/null 2>&1") != 0) {
             fprintf(stderr, "Error: sudo is required but not found\n");
             return 1;
@@ -479,7 +459,6 @@ int install_package(const char *package_name, const char *repo) {
     }
 }
 
-// Remove package
 int remove_package(const char *package_name) {
     if (package_name == NULL || strlen(package_name) == 0) {
         fprintf(stderr, "Error: Invalid package name\n");
@@ -500,7 +479,6 @@ int remove_package(const char *package_name) {
     return system(command);
 }
 
-// Free package data
 void free_package_data(Package *packages, int count) {
     if (packages == NULL) {
         return;
@@ -518,7 +496,6 @@ void free_package_data(Package *packages, int count) {
     free(packages);
 }
 
-// Print usage
 void print_usage() {
     printf("Usage: methaur [options] [package]\n");
     printf("Options:\n");
@@ -536,10 +513,10 @@ int main(int argc, char *argv[]) {
     // Initialize curl
     curl_global_init(CURL_GLOBAL_DEFAULT);
     
-    // Create necessary directories
+  
     create_directories();
     
-    // Check arguments
+    
     if (argc < 2) {
         print_usage();
         curl_global_cleanup();
@@ -548,7 +525,7 @@ int main(int argc, char *argv[]) {
     
     int ret = 0;
     
-    // Parse arguments
+   
     if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
         print_usage();
     } else if (strcmp(argv[1], "-R") == 0 || strcmp(argv[1], "--remove") == 0) {
@@ -573,7 +550,7 @@ int main(int argc, char *argv[]) {
             query = argv[1];
         }
         
-        // Search for packages
+        
         Package *results = NULL;
         int count = 0;
         
@@ -585,7 +562,7 @@ int main(int argc, char *argv[]) {
         } else {
             display_search_results(results, count);
             
-            // Ask for selection
+            
             int selection = 0;
             char input[32];
             printf("Enter package number to install (1-%d), or 0 to cancel: ", count);
@@ -604,7 +581,7 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    // Clean up curl
+    
     curl_global_cleanup();
     
     return ret;
