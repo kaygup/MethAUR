@@ -39,14 +39,24 @@ void free_package_data(Package *packages, int count);
 int download_and_build_package(const char *package_name);
 void create_directories();
 void print_usage();
+char *safe_strdup(const char *str);
+
+// Safe string duplication (handles NULL)
+char *safe_strdup(const char *str) {
+    return str ? strdup(str) : strdup("");
+}
 
 // Callback function for curl
 static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t real_size = size * nmemb;
     CurlData *mem = (CurlData *)userp;
     
+    if (mem == NULL) {
+        return 0;
+    }
+    
     char *ptr = realloc(mem->data, mem->size + real_size + 1);
-    if(!ptr) {
+    if (!ptr) {
         fprintf(stderr, "Error: Out of memory\n");
         return 0;
     }
@@ -62,15 +72,23 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, void *us
 // Search for packages
 void search_packages(const char *query, Package **results, int *count) {
     CURL *curl;
-    CURLHcode res;
+    CURLcode res;  // Fixed typo: CURLHcode -> CURLcode
     CurlData chunk;
     char url[MAX_BUFFER];
     
+    *count = 0;  // Initialize count to zero in case of failure
+    *results = NULL;
+    
     chunk.data = malloc(1);
+    if (chunk.data == NULL) {
+        fprintf(stderr, "Error: Failed to allocate memory\n");
+        return;
+    }
     chunk.size = 0;
+    chunk.data[0] = '\0';
     
     curl = curl_easy_init();
-    if(curl) {
+    if (curl) {
         snprintf(url, MAX_BUFFER, "%s%s", AUR_RPC_URL, query);
         
         curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -80,25 +98,64 @@ void search_packages(const char *query, Package **results, int *count) {
         
         res = curl_easy_perform(curl);
         
-        if(res != CURLE_OK) {
+        if (res != CURLE_OK) {
             fprintf(stderr, "Error: curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
-            *count = 0;
+            free(chunk.data);
+            curl_easy_cleanup(curl);
             return;
         }
         
-        struct json_object *root, *results_obj, *package_obj;
-        struct json_object *name_obj, *version_obj, *desc_obj, *votes_obj, *maintainer_obj, *url_obj;
+        struct json_object *root = NULL, *results_obj = NULL;
         
-        root = json_tokener_parse(chunk.data);
-        json_object_object_get_ex(root, "results", &results_obj);
+        // Parse JSON data
+        enum json_tokener_error jerr = json_tokener_success;
+        root = json_tokener_parse_verbose(chunk.data, &jerr);
+        
+        if (root == NULL || jerr != json_tokener_success) {
+            fprintf(stderr, "Error: Failed to parse JSON response\n");
+            free(chunk.data);
+            curl_easy_cleanup(curl);
+            return;
+        }
+        
+        // Get results array
+        if (!json_object_object_get_ex(root, "results", &results_obj) || results_obj == NULL) {
+            fprintf(stderr, "Error: No results found in JSON response\n");
+            json_object_put(root);
+            free(chunk.data);
+            curl_easy_cleanup(curl);
+            return;
+        }
         
         int num_results = json_object_array_length(results_obj);
+        if (num_results <= 0) {
+            fprintf(stderr, "No packages found for '%s'\n", query);
+            json_object_put(root);
+            free(chunk.data);
+            curl_easy_cleanup(curl);
+            return;
+        }
+        
         *count = (num_results > MAX_PACKAGES) ? MAX_PACKAGES : num_results;
         
-        *results = (Package *)malloc(sizeof(Package) * (*count));
+        *results = (Package *)calloc(*count, sizeof(Package));
+        if (*results == NULL) {
+            fprintf(stderr, "Error: Failed to allocate memory for results\n");
+            *count = 0;
+            json_object_put(root);
+            free(chunk.data);
+            curl_easy_cleanup(curl);
+            return;
+        }
         
-        for(int i = 0; i < *count; i++) {
-            package_obj = json_object_array_get_idx(results_obj, i);
+        for (int i = 0; i < *count; i++) {
+            struct json_object *package_obj = json_object_array_get_idx(results_obj, i);
+            if (package_obj == NULL) {
+                continue;
+            }
+            
+            struct json_object *name_obj = NULL, *version_obj = NULL, *desc_obj = NULL;
+            struct json_object *votes_obj = NULL, *maintainer_obj = NULL, *url_obj = NULL;
             
             json_object_object_get_ex(package_obj, "Name", &name_obj);
             json_object_object_get_ex(package_obj, "Version", &version_obj);
@@ -107,16 +164,18 @@ void search_packages(const char *query, Package **results, int *count) {
             json_object_object_get_ex(package_obj, "Maintainer", &maintainer_obj);
             json_object_object_get_ex(package_obj, "URL", &url_obj);
             
-            (*results)[i].name = strdup(json_object_get_string(name_obj));
-            (*results)[i].version = strdup(json_object_get_string(version_obj));
-            (*results)[i].description = strdup(json_object_get_string(desc_obj));
-            (*results)[i].votes = json_object_get_int(votes_obj);
-            (*results)[i].maintainer = strdup(json_object_get_string(maintainer_obj));
-            (*results)[i].url = strdup(json_object_get_string(url_obj));
+            (*results)[i].name = name_obj ? safe_strdup(json_object_get_string(name_obj)) : safe_strdup("");
+            (*results)[i].version = version_obj ? safe_strdup(json_object_get_string(version_obj)) : safe_strdup("");
+            (*results)[i].description = desc_obj ? safe_strdup(json_object_get_string(desc_obj)) : safe_strdup("");
+            (*results)[i].votes = votes_obj ? json_object_get_int(votes_obj) : 0;
+            (*results)[i].maintainer = maintainer_obj ? safe_strdup(json_object_get_string(maintainer_obj)) : safe_strdup("None");
+            (*results)[i].url = url_obj ? safe_strdup(json_object_get_string(url_obj)) : safe_strdup("");
         }
         
         json_object_put(root);
         curl_easy_cleanup(curl);
+    } else {
+        fprintf(stderr, "Error: Failed to initialize curl\n");
     }
     
     free(chunk.data);
@@ -124,61 +183,88 @@ void search_packages(const char *query, Package **results, int *count) {
 
 // Display search results
 void display_search_results(Package *results, int count) {
+    if (results == NULL || count <= 0) {
+        printf("No results to display.\n");
+        return;
+    }
+    
     printf("\n");
     printf("%-3s %-25s %-15s %-8s %-15s %s\n", "ID", "Name", "Version", "Votes", "Maintainer", "Description");
     printf("-----------------------------------------------------------------------------------------\n");
     
-    for(int i = 0; i < count; i++) {
+    for (int i = 0; i < count; i++) {
         printf("%-3d %-25s %-15s %-8d %-15.15s %.50s\n", 
                i + 1, 
-               results[i].name, 
-               results[i].version, 
+               results[i].name ? results[i].name : "", 
+               results[i].version ? results[i].version : "", 
                results[i].votes,
                results[i].maintainer ? results[i].maintainer : "None", 
-               results[i].description);
+               results[i].description ? results[i].description : "");
     }
     printf("\n");
 }
 
 // Create necessary directories
 void create_directories() {
-    system("mkdir -p " TMP_DIR);
+    char command[MAX_BUFFER];
+    snprintf(command, MAX_BUFFER, "mkdir -p %s", TMP_DIR);
+    system(command);
 }
 
 // Download and build package
 int download_and_build_package(const char *package_name) {
+    if (package_name == NULL || strlen(package_name) == 0) {
+        fprintf(stderr, "Error: Invalid package name\n");
+        return 1;
+    }
+    
     char command[MAX_BUFFER];
     int status;
     
     // Get into temp directory
-    chdir(TMP_DIR);
+    if (chdir(TMP_DIR) != 0) {
+        fprintf(stderr, "Error: Failed to change to directory %s\n", TMP_DIR);
+        return 1;
+    }
     
     // Download package
+    printf("Downloading %s...\n", package_name);
     snprintf(command, MAX_BUFFER, "curl -s %s%s.tar.gz -o %s.tar.gz", AUR_PKG_URL, package_name, package_name);
     status = system(command);
-    if(status != 0) {
+    if (status != 0) {
         fprintf(stderr, "Error: Failed to download package %s\n", package_name);
         return 1;
     }
     
     // Extract package
+    printf("Extracting %s...\n", package_name);
     snprintf(command, MAX_BUFFER, "tar -xzf %s.tar.gz", package_name);
     status = system(command);
-    if(status != 0) {
+    if (status != 0) {
         fprintf(stderr, "Error: Failed to extract package %s\n", package_name);
         return 1;
     }
     
+    // Check if directory exists
+    char package_dir[MAX_BUFFER];
+    snprintf(package_dir, MAX_BUFFER, "%s%s", TMP_DIR, package_name);
+    if (access(package_dir, F_OK) != 0) {
+        fprintf(stderr, "Error: Package directory %s not found after extraction\n", package_dir);
+        return 1;
+    }
+    
     // Build package
+    printf("Building and installing %s...\n", package_name);
     snprintf(command, MAX_BUFFER, "cd %s && makepkg -si --noconfirm", package_name);
     status = system(command);
-    if(status != 0) {
+    if (status != 0) {
         fprintf(stderr, "Error: Failed to build/install package %s\n", package_name);
         return 1;
     }
     
     // Clean up
-    snprintf(command, MAX_BUFFER, "rm -rf %s*", package_name);
+    printf("Cleaning up...\n");
+    snprintf(command, MAX_BUFFER, "rm -rf %s%s*", TMP_DIR, package_name);
     system(command);
     
     return 0;
@@ -186,14 +272,26 @@ int download_and_build_package(const char *package_name) {
 
 // Install package
 int install_package(const char *package_name) {
+    if (package_name == NULL || strlen(package_name) == 0) {
+        fprintf(stderr, "Error: Invalid package name\n");
+        return 1;
+    }
+    
     printf("Installing %s...\n", package_name);
     
     // Check if package exists in official repositories
     char command[MAX_BUFFER];
     snprintf(command, MAX_BUFFER, "pacman -Si %s > /dev/null 2>&1", package_name);
     
-    if(system(command) == 0) {
+    if (system(command) == 0) {
         printf("Package %s found in official repositories. Installing with pacman...\n", package_name);
+        
+        // Check for sudo
+        if (system("which sudo > /dev/null 2>&1") != 0) {
+            fprintf(stderr, "Error: sudo is required but not found\n");
+            return 1;
+        }
+        
         snprintf(command, MAX_BUFFER, "sudo pacman -S --noconfirm %s", package_name);
         return system(command);
     } else {
@@ -204,17 +302,32 @@ int install_package(const char *package_name) {
 
 // Remove package
 int remove_package(const char *package_name) {
+    if (package_name == NULL || strlen(package_name) == 0) {
+        fprintf(stderr, "Error: Invalid package name\n");
+        return 1;
+    }
+    
     printf("Removing %s...\n", package_name);
     
+    // Check for sudo
+    if (system("which sudo > /dev/null 2>&1") != 0) {
+        fprintf(stderr, "Error: sudo is required but not found\n");
+        return 1;
+    }
+    
     char command[MAX_BUFFER];
-    snprintf(command, MAX_BUFFER, "sudo pacman -R %s", package_name);
+    snprintf(command, MAX_BUFFER, "sudo pacman -R --noconfirm %s", package_name);
     
     return system(command);
 }
 
 // Free package data
 void free_package_data(Package *packages, int count) {
-    for(int i = 0; i < count; i++) {
+    if (packages == NULL) {
+        return;
+    }
+    
+    for (int i = 0; i < count; i++) {
         free(packages[i].name);
         free(packages[i].version);
         free(packages[i].description);
@@ -241,34 +354,42 @@ void print_usage() {
 
 int main(int argc, char *argv[]) {
     // Initialize curl
-    curl_global_init(CURL_GLOBAL_DEFAULT);
+    CURLcode curl_init = curl_global_init(CURL_GLOBAL_DEFAULT);
+    if (curl_init != CURLE_OK) {
+        fprintf(stderr, "Error: Failed to initialize curl\n");
+        return 1;
+    }
     
     // Create necessary directories
     create_directories();
     
     // Check arguments
-    if(argc < 2) {
+    if (argc < 2) {
         print_usage();
+        curl_global_cleanup();
         return 1;
     }
     
+    int ret = 0;
+    
     // Parse arguments
-    if(strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+    if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
         print_usage();
-        return 0;
-    } else if(strcmp(argv[1], "-R") == 0 || strcmp(argv[1], "--remove") == 0) {
-        if(argc < 3) {
+    } else if (strcmp(argv[1], "-R") == 0 || strcmp(argv[1], "--remove") == 0) {
+        if (argc < 3) {
             fprintf(stderr, "Error: No package specified for removal\n");
-            return 1;
+            ret = 1;
+        } else {
+            ret = remove_package(argv[2]);
         }
-        return remove_package(argv[2]);
     } else {
         const char *query;
         
         // Handle -S flag
-        if(strcmp(argv[1], "-S") == 0 || strcmp(argv[1], "--sync") == 0) {
-            if(argc < 3) {
+        if (strcmp(argv[1], "-S") == 0 || strcmp(argv[1], "--sync") == 0) {
+            if (argc < 3) {
                 fprintf(stderr, "Error: No package specified for installation\n");
+                curl_global_cleanup();
                 return 1;
             }
             query = argv[2];
@@ -277,37 +398,49 @@ int main(int argc, char *argv[]) {
         }
         
         // Search for packages
-        Package *results;
-        int count;
+        Package *results = NULL;
+        int count = 0;
         
         search_packages(query, &results, &count);
         
-        if(count == 0) {
+        if (count == 0 || results == NULL) {
             printf("No packages found for '%s'\n", query);
-            return 1;
-        }
-        
-        display_search_results(results, count);
-        
-        // Ask for selection
-        int selection;
-        printf("Enter package number to install (1-%d), or 0 to cancel: ", count);
-        scanf("%d", &selection);
-        
-        if(selection <= 0 || selection > count) {
-            printf("Installation cancelled.\n");
+            ret = 1;
+        } else {
+            display_search_results(results, count);
+            
+            // Ask for selection
+            int selection = 0;
+            char input[32];
+            printf("Enter package number to install (1-%d), or 0 to cancel: ", count);
+            if (fgets(input, sizeof(input), stdin) == NULL) {
+                selection = 0;
+            } else {
+                selection = atoi(input);
+                if (selection < 0) selection = 0;
+            }
+            
+            // Handle initial newline if no previous input was read
+            if (selection == 0 && input[0] != '0') {
+                printf("Enter package number to install (1-%d), or 0 to cancel: ", count);
+                if (fgets(input, sizeof(input), stdin) != NULL) {
+                    selection = atoi(input);
+                    if (selection < 0) selection = 0;
+                }
+            }
+            
+            if (selection <= 0 || selection > count) {
+                printf("Installation cancelled.\n");
+            } else {
+                ret = install_package(results[selection - 1].name);
+            }
+            
             free_package_data(results, count);
-            return 0;
         }
-        
-        int ret = install_package(results[selection - 1].name);
-        free_package_data(results, count);
-        
-        return ret;
     }
     
     // Clean up curl
     curl_global_cleanup();
     
-    return 0;
+    return ret;
 }
