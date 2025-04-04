@@ -6,12 +6,11 @@
 #include <sys/wait.h>
 #include <curl/curl.h>
 #include <json-c/json.h>
-#include <ctype.h>
 
 #define MAX_PACKAGES 50
 #define MAX_BUFFER 8192
-#define MAX_DEPS 100
 #define AUR_RPC_URL "https://aur.archlinux.org/rpc/?v=5&type=search&arg="
+#define AUR_INFO_URL "https://aur.archlinux.org/rpc/?v=5&type=info&arg[]="
 #define AUR_PKG_URL "https://aur.archlinux.org/cgit/aur.git/snapshot/"
 #define TMP_DIR "/tmp/methaur/"
 
@@ -23,6 +22,10 @@ typedef struct {
     int votes;
     char *maintainer;
     char *url;
+    char **depends;
+    int depends_count;
+    char **makedepends;
+    int makedepends_count;
 } Package;
 
 // Structure for curl data
@@ -31,26 +34,21 @@ typedef struct {
     size_t size;
 } CurlData;
 
-// Program options structure
-typedef struct {
-    int remove_deps;     // Whether to remove build dependencies after installation
-    int sync_mode;       // Whether in sync mode
-    int remove_mode;     // Whether in remove mode
-} Options;
-
 // Function declarations
 static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp);
 void search_packages(const char *query, Package **results, int *count);
+void get_package_details(const char *package_name, Package *package);
 void display_search_results(Package *results, int count);
-int install_package(const char *package_name, Options *opts);
+int install_package(const char *package_name);
 int remove_package(const char *package_name);
 void free_package_data(Package *packages, int count);
-int download_and_build_package(const char *package_name, Options *opts);
+int download_and_build_package(const char *package_name);
 void create_directories();
 void print_usage();
 char *safe_strdup(const char *str);
-void get_package_dependencies(const char *package_dir, char **deps, int *dep_count);
-int install_dependencies(char **deps, int dep_count, Options *opts);
+int install_dependencies(Package *package);
+int check_package_installed(const char *package_name);
+void clean_build_environment();
 
 // Safe string duplication (handles NULL)
 char *safe_strdup(const char *str) {
@@ -78,6 +76,129 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, void *us
     mem->data[mem->size] = 0;
     
     return real_size;
+}
+
+// Get detailed package information from AUR
+void get_package_details(const char *package_name, Package *package) {
+    CURL *curl;
+    CURLcode res;
+    CurlData chunk;
+    char url[MAX_BUFFER];
+    
+    if (package == NULL || package_name == NULL) {
+        return;
+    }
+    
+    // Initialize package
+    package->depends = NULL;
+    package->depends_count = 0;
+    package->makedepends = NULL;
+    package->makedepends_count = 0;
+    
+    chunk.data = malloc(1);
+    if (chunk.data == NULL) {
+        fprintf(stderr, "Error: Failed to allocate memory\n");
+        return;
+    }
+    chunk.size = 0;
+    chunk.data[0] = '\0';
+    
+    curl = curl_easy_init();
+    if (curl) {
+        snprintf(url, MAX_BUFFER, "%s%s", AUR_INFO_URL, package_name);
+        
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "methaur/1.0");
+        
+        res = curl_easy_perform(curl);
+        
+        if (res != CURLE_OK) {
+            fprintf(stderr, "Error: curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+            free(chunk.data);
+            curl_easy_cleanup(curl);
+            return;
+        }
+        
+        struct json_object *root = NULL, *results_obj = NULL, *package_obj = NULL;
+        
+        // Parse JSON data
+        enum json_tokener_error jerr = json_tokener_success;
+        root = json_tokener_parse_verbose(chunk.data, &jerr);
+        
+        if (root == NULL || jerr != json_tokener_success) {
+            fprintf(stderr, "Error: Failed to parse JSON response\n");
+            free(chunk.data);
+            curl_easy_cleanup(curl);
+            return;
+        }
+        
+        // Get results array
+        if (!json_object_object_get_ex(root, "results", &results_obj) || results_obj == NULL) {
+            fprintf(stderr, "Error: No results found in JSON response\n");
+            json_object_put(root);
+            free(chunk.data);
+            curl_easy_cleanup(curl);
+            return;
+        }
+        
+        int num_results = json_object_array_length(results_obj);
+        if (num_results <= 0) {
+            fprintf(stderr, "No package information found for '%s'\n", package_name);
+            json_object_put(root);
+            free(chunk.data);
+            curl_easy_cleanup(curl);
+            return;
+        }
+        
+        package_obj = json_object_array_get_idx(results_obj, 0);
+        if (package_obj == NULL) {
+            fprintf(stderr, "Error: Failed to get package information\n");
+            json_object_put(root);
+            free(chunk.data);
+            curl_easy_cleanup(curl);
+            return;
+        }
+        
+        // Get dependencies
+        struct json_object *depends_obj = NULL, *makedepends_obj = NULL;
+        
+        if (json_object_object_get_ex(package_obj, "Depends", &depends_obj)) {
+            int depends_length = json_object_array_length(depends_obj);
+            if (depends_length > 0) {
+                package->depends = (char **)malloc(depends_length * sizeof(char *));
+                if (package->depends != NULL) {
+                    package->depends_count = depends_length;
+                    for (int i = 0; i < depends_length; i++) {
+                        struct json_object *dep_obj = json_object_array_get_idx(depends_obj, i);
+                        package->depends[i] = safe_strdup(json_object_get_string(dep_obj));
+                    }
+                }
+            }
+        }
+        
+        if (json_object_object_get_ex(package_obj, "MakeDepends", &makedepends_obj)) {
+            int makedepends_length = json_object_array_length(makedepends_obj);
+            if (makedepends_length > 0) {
+                package->makedepends = (char **)malloc(makedepends_length * sizeof(char *));
+                if (package->makedepends != NULL) {
+                    package->makedepends_count = makedepends_length;
+                    for (int i = 0; i < makedepends_length; i++) {
+                        struct json_object *dep_obj = json_object_array_get_idx(makedepends_obj, i);
+                        package->makedepends[i] = safe_strdup(json_object_get_string(dep_obj));
+                    }
+                }
+            }
+        }
+        
+        json_object_put(root);
+        curl_easy_cleanup(curl);
+    } else {
+        fprintf(stderr, "Error: Failed to initialize curl\n");
+    }
+    
+    free(chunk.data);
 }
 
 // Search for packages
@@ -181,6 +302,10 @@ void search_packages(const char *query, Package **results, int *count) {
             (*results)[i].votes = votes_obj ? json_object_get_int(votes_obj) : 0;
             (*results)[i].maintainer = maintainer_obj ? safe_strdup(json_object_get_string(maintainer_obj)) : safe_strdup("None");
             (*results)[i].url = url_obj ? safe_strdup(json_object_get_string(url_obj)) : safe_strdup("");
+            (*results)[i].depends = NULL;
+            (*results)[i].depends_count = 0;
+            (*results)[i].makedepends = NULL;
+            (*results)[i].makedepends_count = 0;
         }
         
         json_object_put(root);
@@ -222,150 +347,152 @@ void create_directories() {
     system(command);
 }
 
-// Parse PKGBUILD for dependencies
-void get_package_dependencies(const char *package_dir, char **deps, int *dep_count) {
+// Check if a package is already installed
+int check_package_installed(const char *package_name) {
     char command[MAX_BUFFER];
-    char buffer[MAX_BUFFER];
-    FILE *fp;
-    *dep_count = 0;
-    
-    // Set up commands to extract dependencies from PKGBUILD
-    snprintf(command, MAX_BUFFER, 
-             "cd %s && source PKGBUILD && "
-             "echo \"${depends[@]}\" && "
-             "echo \"${makedepends[@]}\" && "
-             "echo \"${checkdepends[@]}\"", 
-             package_dir);
-    
-    fp = popen(command, "r");
-    if (fp == NULL) {
-        fprintf(stderr, "Error: Failed to parse PKGBUILD for dependencies\n");
-        return;
-    }
-    
-    // Read dependencies
-    while (fgets(buffer, MAX_BUFFER, fp) != NULL && *dep_count < MAX_DEPS) {
-        // Skip empty lines
-        if (strlen(buffer) <= 1) continue;
-        
-        // Trim newline
-        buffer[strcspn(buffer, "\n")] = 0;
-        
-        // Split by spaces to get individual dependencies
-        char *token = strtok(buffer, " ");
-        while (token != NULL && *dep_count < MAX_DEPS) {
-            // Skip empty tokens
-            if (strlen(token) > 0) {
-                // Extract package name (without version constraints)
-                char *version_sep = strpbrk(token, "<>=");
-                if (version_sep != NULL) {
-                    *version_sep = '\0';
-                }
-                
-                // Trim any remaining spaces
-                size_t len = strlen(token);
-                while (len > 0 && isspace((unsigned char)token[len - 1])) {
-                    token[--len] = '\0';
-                }
-                
-                if (strlen(token) > 0) {
-                    deps[*dep_count] = strdup(token);
-                    (*dep_count)++;
-                }
-            }
-            token = strtok(NULL, " ");
-        }
-    }
-    
-    pclose(fp);
+    snprintf(command, MAX_BUFFER, "pacman -Q %s > /dev/null 2>&1", package_name);
+    return system(command) == 0;
 }
 
-// Install dependencies
-int install_dependencies(char **deps, int dep_count, Options *opts) {
-    if (dep_count == 0) {
-        return 0; // No dependencies to install
+// Clean build environment - install missing base-devel packages
+void clean_build_environment() {
+    printf("Setting up a clean build environment...\n");
+    
+    // Check if base-devel is installed, if not install it
+    if (system("pacman -Qg base-devel > /dev/null 2>&1") != 0) {
+        printf("Installing base-devel group which is required for building packages...\n");
+        system("sudo pacman -S --needed --noconfirm base-devel");
     }
     
-    printf("==> Installing %d dependencies...\n", dep_count);
+    // Ensure important tools are installed
+    const char *essential_tools[] = {
+        "autoconf", "automake", "binutils", "bison", "fakeroot", "file", 
+        "findutils", "flex", "gawk", "gcc", "gettext", "grep", "groff", 
+        "gzip", "libtool", "m4", "make", "pacman", "patch", "pkgconf", 
+        "sed", "sudo", "texinfo", "which"
+    };
     
-    // Track which dependencies are build-only for later removal if requested
-    char *build_deps[MAX_DEPS];
-    int build_dep_count = 0;
-    
-    for (int i = 0; i < dep_count; i++) {
-        // First try to install from official repos
-        char command[MAX_BUFFER];
-        snprintf(command, MAX_BUFFER, "pacman -Qi %s >/dev/null 2>&1", deps[i]);
-        
-        if (system(command) == 0) {
-            printf("==> Dependency %s is already installed\n", deps[i]);
-            continue;
-        }
-        
-        snprintf(command, MAX_BUFFER, "pacman -Si %s >/dev/null 2>&1", deps[i]);
-        
-        if (system(command) == 0) {
-            printf("==> Installing dependency %s from repositories\n", deps[i]);
-            snprintf(command, MAX_BUFFER, "sudo pacman -S --noconfirm --needed %s", deps[i]);
-            
-            if (system(command) != 0) {
-                fprintf(stderr, "Error: Failed to install dependency %s\n", deps[i]);
-                return 1;
+    int missing = 0;
+    for (size_t i = 0; i < sizeof(essential_tools) / sizeof(essential_tools[0]); i++) {
+        char check_cmd[MAX_BUFFER];
+        snprintf(check_cmd, MAX_BUFFER, "pacman -Q %s > /dev/null 2>&1", essential_tools[i]);
+        if (system(check_cmd) != 0) {
+            if (!missing) {
+                printf("Installing missing build tools:\n");
+                missing = 1;
             }
-            
-            // Add to list of build deps for potential removal
-            if (opts->remove_deps) {
-                build_deps[build_dep_count++] = strdup(deps[i]);
-            }
-        } else {
-            // Install from AUR if not in repositories
-            printf("==> Installing dependency %s from AUR\n", deps[i]);
-            Options dep_opts = *opts;
-            dep_opts.remove_deps = 0; // Don't cascade removal for AUR deps
-            
-            // Recursive dependency installation
-            if (install_package(deps[i], &dep_opts) != 0) {
-                fprintf(stderr, "Error: Failed to install AUR dependency %s\n", deps[i]);
-                return 1;
-            }
-            
-            // Add to list of build deps for potential removal
-            if (opts->remove_deps) {
-                build_deps[build_dep_count++] = strdup(deps[i]);
-            }
+            printf("  - %s\n", essential_tools[i]);
+            char install_cmd[MAX_BUFFER];
+            snprintf(install_cmd, MAX_BUFFER, "sudo pacman -S --needed --noconfirm %s", essential_tools[i]);
+            system(install_cmd);
         }
     }
     
-    // Store build dependencies in a file for later removal if requested
-    if (opts->remove_deps && build_dep_count > 0) {
-        char filename[MAX_BUFFER];
-        snprintf(filename, MAX_BUFFER, "%sbuild_deps", TMP_DIR);
+    if (!missing) {
+        printf("All required build tools are already installed.\n");
+    }
+}
+
+// Install dependencies for a package
+int install_dependencies(Package *package) {
+    if (package == NULL) {
+        return 0;
+    }
+    
+    int ret = 0;
+    
+    // Install runtime dependencies
+    if (package->depends_count > 0 && package->depends != NULL) {
+        printf("Installing dependencies...\n");
         
-        FILE *fp = fopen(filename, "w");
-        if (fp != NULL) {
-            for (int i = 0; i < build_dep_count; i++) {
-                fprintf(fp, "%s\n", build_deps[i]);
-                free(build_deps[i]);
+        for (int i = 0; i < package->depends_count; i++) {
+            if (package->depends[i] == NULL || strlen(package->depends[i]) == 0) {
+                continue;
             }
-            fclose(fp);
-        } else {
-            fprintf(stderr, "Warning: Could not save build dependency list for later removal\n");
+            
+            // Remove version requirements from dependency string
+            char *dep = strdup(package->depends[i]);
+            char *p = dep;
+            while (*p && *p != '<' && *p != '>' && *p != '=') p++;
+            *p = '\0';
+            
+            // Skip if already installed
+            if (check_package_installed(dep)) {
+                printf("Dependency %s is already installed.\n", dep);
+                free(dep);
+                continue;
+            }
+            
+            printf("Installing dependency: %s\n", dep);
+            install_package(dep);
+            free(dep);
         }
     }
     
-    return 0;
+    // Install build dependencies
+    if (package->makedepends_count > 0 && package->makedepends != NULL) {
+        printf("Installing build dependencies...\n");
+        
+        for (int i = 0; i < package->makedepends_count; i++) {
+            if (package->makedepends[i] == NULL || strlen(package->makedepends[i]) == 0) {
+                continue;
+            }
+            
+            // Remove version requirements from dependency string
+            char *dep = strdup(package->makedepends[i]);
+            char *p = dep;
+            while (*p && *p != '<' && *p != '>' && *p != '=') p++;
+            *p = '\0';
+            
+            // Skip if already installed
+            if (check_package_installed(dep)) {
+                printf("Build dependency %s is already installed.\n", dep);
+                free(dep);
+                continue;
+            }
+            
+            printf("Installing build dependency: %s\n", dep);
+            install_package(dep);
+            free(dep);
+        }
+    }
+    
+    return ret;
 }
 
 // Download and build package
-int download_and_build_package(const char *package_name, Options *opts) {
+int download_and_build_package(const char *package_name) {
     if (package_name == NULL || strlen(package_name) == 0) {
         fprintf(stderr, "Error: Invalid package name\n");
         return 1;
     }
     
     char command[MAX_BUFFER];
-    char package_dir[MAX_BUFFER];
     int status;
+    
+    // Check if already installed
+    if (check_package_installed(package_name)) {
+        printf("Package %s is already installed.\n", package_name);
+        char upgrade_input[32];
+        printf("Do you want to reinstall/upgrade it? (y/N): ");
+        fgets(upgrade_input, sizeof(upgrade_input), stdin);
+        if (upgrade_input[0] != 'y' && upgrade_input[0] != 'Y') {
+            printf("Skipping installation of %s\n", package_name);
+            return 0;
+        }
+    }
+    
+    // Clean build environment and ensure all necessary tools are available
+    clean_build_environment();
+    
+    // Get package dependencies
+    Package package;
+    memset(&package, 0, sizeof(Package));
+    package.name = safe_strdup(package_name);
+    get_package_details(package_name, &package);
+    
+    // Install dependencies first
+    install_dependencies(&package);
     
     // Get into temp directory
     if (chdir(TMP_DIR) != 0) {
@@ -373,8 +500,12 @@ int download_and_build_package(const char *package_name, Options *opts) {
         return 1;
     }
     
+    // Clean any previous failed builds
+    snprintf(command, MAX_BUFFER, "rm -rf %s%s*", TMP_DIR, package_name);
+    system(command);
+    
     // Download package
-    printf("==> Downloading %s...\n", package_name);
+    printf("Downloading %s...\n", package_name);
     snprintf(command, MAX_BUFFER, "curl -s %s%s.tar.gz -o %s.tar.gz", AUR_PKG_URL, package_name, package_name);
     status = system(command);
     if (status != 0) {
@@ -383,7 +514,7 @@ int download_and_build_package(const char *package_name, Options *opts) {
     }
     
     // Extract package
-    printf("==> Extracting %s...\n", package_name);
+    printf("Extracting %s...\n", package_name);
     snprintf(command, MAX_BUFFER, "tar -xzf %s.tar.gz", package_name);
     status = system(command);
     if (status != 0) {
@@ -391,107 +522,128 @@ int download_and_build_package(const char *package_name, Options *opts) {
         return 1;
     }
     
-    // Set up package directory path
-    snprintf(package_dir, MAX_BUFFER, "%s%s", TMP_DIR, package_name);
-    
     // Check if directory exists
+    char package_dir[MAX_BUFFER];
+    snprintf(package_dir, MAX_BUFFER, "%s%s", TMP_DIR, package_name);
     if (access(package_dir, F_OK) != 0) {
         fprintf(stderr, "Error: Package directory %s not found after extraction\n", package_dir);
         return 1;
     }
     
-    // Parse PKGBUILD for dependencies
-    char *deps[MAX_DEPS];
-    int dep_count = 0;
-    
-    printf("==> Parsing PKGBUILD dependencies for %s...\n", package_name);
-    get_package_dependencies(package_dir, deps, &dep_count);
-    
-    if (dep_count > 0) {
-        printf("==> Found %d dependencies for %s\n", dep_count, package_name);
-        for (int i = 0; i < dep_count; i++) {
-            printf("    %s\n", deps[i]);
-        }
-        
-        // Install dependencies
-        if (install_dependencies(deps, dep_count, opts) != 0) {
-            fprintf(stderr, "Error: Failed to install all dependencies\n");
-            
-            // Clean up memory
-            for (int i = 0; i < dep_count; i++) {
-                free(deps[i]);
-            }
-            
-            return 1;
-        }
-        
-        // Clean up memory
-        for (int i = 0; i < dep_count; i++) {
-            free(deps[i]);
-        }
-    } else {
-        printf("==> No dependencies found for %s\n", package_name);
+    // Enter the package directory
+    if (chdir(package_dir) != 0) {
+        fprintf(stderr, "Error: Failed to change to directory %s\n", package_dir);
+        return 1;
     }
     
-    // Build package
-    printf("==> Building and installing %s...\n", package_name);
-    snprintf(command, MAX_BUFFER, "cd %s && makepkg -si --noconfirm", package_name);
-    status = system(command);
+    // Check if a PKGBUILD exists
+    if (access("PKGBUILD", F_OK) != 0) {
+        fprintf(stderr, "Error: PKGBUILD file not found\n");
+        return 1;
+    }
+    
+    // Special handling for packages with known issues
+    if (strcmp(package_name, "cava-git") == 0 || strcmp(package_name, "cava") == 0) {
+        printf("Applying special handling for cava packages...\n");
+        
+        // Ensure required dependencies are installed
+        system("sudo pacman -S --needed --noconfirm autoconf automake libtool m4 fftw ncurses alsa-lib iniparser");
+        
+        // Modify PKGBUILD if necessary to fix common issues
+        system("grep -q 'AX_CHECK_GL' PKGBUILD && sed -i 's/--enable-gl/--disable-gl/g' PKGBUILD");
+    }
+    
+    // Build package with better error handling
+    printf("Building %s...\n", package_name);
+    status = system("makepkg -sf");
     if (status != 0) {
-        fprintf(stderr, "Error: Failed to build/install package %s\n", package_name);
+        fprintf(stderr, "Error: Failed to build package %s\n", package_name);
+        
+        // Try to clean up potential issues and retry
+        printf("Trying to fix build issues and retry...\n");
+        
+        // Check if it's an autotools project and run autoreconf if needed
+        if (access("configure.ac", F_OK) == 0 || access("configure.in", F_OK) == 0) {
+            printf("Running autoreconf to regenerate build files...\n");
+            system("autoreconf -fi");
+        }
+        
+        // Retry build without running configure
+        printf("Retrying build...\n");
+        status = system("makepkg -sf");
+        
+        if (status != 0) {
+            // If still failing, try with --skipinteg
+            printf("Retrying build with --skipinteg...\n");
+            status = system("makepkg -sf --skipinteg");
+            
+            if (status != 0) {
+                fprintf(stderr, "Error: Failed to build package %s after multiple attempts\n", package_name);
+                
+                // Offer to show the build log
+                char view_log[32];
+                printf("Do you want to view the build log? (y/N): ");
+                fgets(view_log, sizeof(view_log), stdin);
+                if (view_log[0] == 'y' || view_log[0] == 'Y') {
+                    system("cat *.log 2>/dev/null || echo 'No log files found'");
+                }
+                
+                return 1;
+            }
+        }
+    }
+    
+    // Install package
+    printf("Installing %s...\n", package_name);
+    snprintf(command, MAX_BUFFER, "sudo pacman -U --noconfirm $(ls %s*.pkg.tar.zst 2>/dev/null || ls %s*.pkg.tar.xz 2>/dev/null || echo 'error')", 
+             package_name, package_name);
+    status = system(command);
+    
+    if (status != 0) {
+        fprintf(stderr, "Error: Failed to install package %s\n", package_name);
         return 1;
     }
     
     // Clean up
-    printf("==> Cleaning up...\n");
+    printf("Cleaning up...\n");
+    chdir(TMP_DIR);
     snprintf(command, MAX_BUFFER, "rm -rf %s%s*", TMP_DIR, package_name);
     system(command);
     
-    // Remove build dependencies if requested
-    if (opts->remove_deps) {
-        char dep_file[MAX_BUFFER];
-        snprintf(dep_file, MAX_BUFFER, "%sbuild_deps", TMP_DIR);
-        
-        if (access(dep_file, F_OK) == 0) {
-            printf("==> Removing build dependencies...\n");
-            
-            FILE *fp = fopen(dep_file, "r");
-            if (fp != NULL) {
-                char line[MAX_BUFFER];
-                while (fgets(line, sizeof(line), fp)) {
-                    // Trim newline
-                    line[strcspn(line, "\n")] = 0;
-                    
-                    if (strlen(line) > 0) {
-                        printf("    Removing %s\n", line);
-                        snprintf(command, MAX_BUFFER, "sudo pacman -Rs --noconfirm %s", line);
-                        system(command);
-                    }
-                }
-                fclose(fp);
-                remove(dep_file);
-            }
+    // Free package data
+    free(package.name);
+    if (package.depends != NULL) {
+        for (int i = 0; i < package.depends_count; i++) {
+            free(package.depends[i]);
         }
+        free(package.depends);
+    }
+    if (package.makedepends != NULL) {
+        for (int i = 0; i < package.makedepends_count; i++) {
+            free(package.makedepends[i]);
+        }
+        free(package.makedepends);
     }
     
+    printf("Successfully installed %s\n", package_name);
     return 0;
 }
 
 // Install package
-int install_package(const char *package_name, Options *opts) {
+int install_package(const char *package_name) {
     if (package_name == NULL || strlen(package_name) == 0) {
         fprintf(stderr, "Error: Invalid package name\n");
         return 1;
     }
     
-    printf("==> Installing %s...\n", package_name);
+    printf("Installing %s...\n", package_name);
     
     // Check if package exists in official repositories
     char command[MAX_BUFFER];
     snprintf(command, MAX_BUFFER, "pacman -Si %s > /dev/null 2>&1", package_name);
     
     if (system(command) == 0) {
-        printf("==> Package %s found in official repositories. Installing with pacman...\n", package_name);
+        printf("Package %s found in official repositories. Installing with pacman...\n", package_name);
         
         // Check for sudo
         if (system("which sudo > /dev/null 2>&1") != 0) {
@@ -499,11 +651,11 @@ int install_package(const char *package_name, Options *opts) {
             return 1;
         }
         
-        snprintf(command, MAX_BUFFER, "sudo pacman -S --noconfirm --needed %s", package_name);
+        snprintf(command, MAX_BUFFER, "sudo pacman -S --needed --noconfirm %s", package_name);
         return system(command);
     } else {
-        printf("==> Package %s not found in official repositories. Installing from AUR...\n", package_name);
-        return download_and_build_package(package_name, opts);
+        printf("Package %s not found in official repositories. Installing from AUR...\n", package_name);
+        return download_and_build_package(package_name);
     }
 }
 
@@ -514,7 +666,7 @@ int remove_package(const char *package_name) {
         return 1;
     }
     
-    printf("==> Removing %s...\n", package_name);
+    printf("Removing %s...\n", package_name);
     
     // Check for sudo
     if (system("which sudo > /dev/null 2>&1") != 0) {
@@ -540,6 +692,20 @@ void free_package_data(Package *packages, int count) {
         free(packages[i].description);
         free(packages[i].maintainer);
         free(packages[i].url);
+        
+        if (packages[i].depends != NULL) {
+            for (int j = 0; j < packages[i].depends_count; j++) {
+                free(packages[i].depends[j]);
+            }
+            free(packages[i].depends);
+        }
+        
+        if (packages[i].makedepends != NULL) {
+            for (int j = 0; j < packages[i].makedepends_count; j++) {
+                free(packages[i].makedepends[j]);
+            }
+            free(packages[i].makedepends);
+        }
     }
     
     free(packages);
@@ -551,14 +717,12 @@ void print_usage() {
     printf("Options:\n");
     printf("  -S, --sync       Search and install package (default action)\n");
     printf("  -R, --remove     Remove package\n");
-    printf("  -c, --clean      Remove build dependencies after installation\n");
     printf("  -h, --help       Show this help message\n");
     printf("\n");
     printf("Examples:\n");
-    printf("  methaur firefox          Search and choose firefox packages to install\n");
-    printf("  methaur -S firefox       Same as above\n");
-    printf("  methaur -S -c firefox    Install firefox and remove build dependencies afterward\n");
-    printf("  methaur -R firefox       Remove firefox package\n");
+    printf("  methaur firefox     Search and choose firefox packages to install\n");
+    printf("  methaur -S firefox  Same as above\n");
+    printf("  methaur -R firefox  Remove firefox package\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -580,55 +744,31 @@ int main(int argc, char *argv[]) {
     }
     
     int ret = 0;
-    Options opts = {0}; // Initialize all options to 0/false
     
     // Parse arguments
-    int arg_index = 1;
-    int package_arg_index = -1;
-    
-    while (arg_index < argc) {
-        if (strcmp(argv[arg_index], "-h") == 0 || strcmp(argv[arg_index], "--help") == 0) {
-            print_usage();
-            curl_global_cleanup();
-            return 0;
-        } else if (strcmp(argv[arg_index], "-S") == 0 || strcmp(argv[arg_index], "--sync") == 0) {
-            opts.sync_mode = 1;
-        } else if (strcmp(argv[arg_index], "-R") == 0 || strcmp(argv[arg_index], "--remove") == 0) {
-            opts.remove_mode = 1;
-        } else if (strcmp(argv[arg_index], "-c") == 0 || strcmp(argv[arg_index], "--clean") == 0) {
-            opts.remove_deps = 1;
-        } else {
-            // First non-option argument is the package name
-            if (package_arg_index == -1) {
-                package_arg_index = arg_index;
-            }
-        }
-        arg_index++;
-    }
-    
-    // Default to sync mode if no mode specified
-    if (!opts.sync_mode && !opts.remove_mode) {
-        opts.sync_mode = 1;
-    }
-    
-    // Handle based on mode
-    if (opts.remove_mode) {
-        if (package_arg_index == -1) {
+    if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+        print_usage();
+    } else if (strcmp(argv[1], "-R") == 0 || strcmp(argv[1], "--remove") == 0) {
+        if (argc < 3) {
             fprintf(stderr, "Error: No package specified for removal\n");
             ret = 1;
         } else {
-            ret = remove_package(argv[package_arg_index]);
+            ret = remove_package(argv[2]);
         }
-    } else if (opts.sync_mode) {
+    } else {
         const char *query;
         
-        if (package_arg_index == -1) {
-            fprintf(stderr, "Error: No package specified for installation\n");
-            curl_global_cleanup();
-            return 1;
+        // Handle -S flag
+        if (strcmp(argv[1], "-S") == 0 || strcmp(argv[1], "--sync") == 0) {
+            if (argc < 3) {
+                fprintf(stderr, "Error: No package specified for installation\n");
+                curl_global_cleanup();
+                return 1;
+            }
+            query = argv[2];
+        } else {
+            query = argv[1];
         }
-        
-        query = argv[package_arg_index];
         
         // Search for packages
         Package *results = NULL;
@@ -665,11 +805,7 @@ int main(int argc, char *argv[]) {
             if (selection <= 0 || selection > count) {
                 printf("Installation cancelled.\n");
             } else {
-                ret = install_package(results[selection - 1].name, &opts);
-                
-                if (ret == 0) {
-                    printf("==> %s has been installed successfully.\n", results[selection - 1].name);
-                }
+                ret = install_package(results[selection - 1].name);
             }
             
             free_package_data(results, count);
