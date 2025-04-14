@@ -32,7 +32,10 @@ Usage: methaur [options] [package]
 Options:
   -S, --sync       Search and install package (default action)
   -R, --remove     Remove package
+  -U <package> Upgrade a certain package
+  -Ufull Full system upgrade
   -h, --help       Show this help message
+  
   (also works without options)
 ```
 
