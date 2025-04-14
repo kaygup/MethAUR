@@ -41,6 +41,8 @@ int download_and_build_package(const char *package_name);
 void create_directories();
 void print_usage();
 char *safe_strdup(const char *str);
+int update_package(const char *package_name);
+int update_system(int full_upgrade);
 
 char *safe_strdup(const char *str) {
     return str ? strdup(str) : strdup("");
@@ -479,6 +481,124 @@ int remove_package(const char *package_name) {
     return system(command);
 }
 
+int update_package(const char *package_name) {
+    if (package_name == NULL || strlen(package_name) == 0) {
+        fprintf(stderr, "Error: Invalid package name\n");
+        return 1;
+    }
+    
+    printf("Updating %s...\n", package_name);
+    
+    // Check if package exists in official repositories
+    char check_cmd[MAX_BUFFER];
+    snprintf(check_cmd, MAX_BUFFER, "pacman -Ss ^%s$ > /dev/null 2>&1", package_name);
+    int is_official = (system(check_cmd) == 0);
+    
+    if (is_official) {
+        // Update official package
+        if (system("which sudo > /dev/null 2>&1") != 0) {
+            fprintf(stderr, "Error: sudo is required but not found\n");
+            return 1;
+        }
+        
+        char command[MAX_BUFFER];
+        snprintf(command, MAX_BUFFER, "sudo pacman -Sy --noconfirm %s", package_name);
+        return system(command);
+    } else {
+        // Check if package exists in AUR
+        char aur_check_cmd[MAX_BUFFER];
+        snprintf(aur_check_cmd, MAX_BUFFER, "curl -s 'https://aur.archlinux.org/rpc/?v=5&type=info&arg=%s' | grep -q '\"ResultCount\":1'", package_name);
+        int is_aur = (system(aur_check_cmd) == 0);
+        
+        if (is_aur) {
+            // Update AUR package by reinstalling it
+            return download_and_build_package(package_name);
+        } else {
+            fprintf(stderr, "Error: Package %s not found in repositories or AUR\n", package_name);
+            return 1;
+        }
+    }
+}
+
+int update_system(int full_upgrade) {
+    printf("Updating package databases...\n");
+    
+    // Check for sudo
+    if (system("which sudo > /dev/null 2>&1") != 0) {
+        fprintf(stderr, "Error: sudo is required but not found\n");
+        return 1;
+    }
+    
+    // Update package database first
+    int status = system("sudo pacman -Sy");
+    if (status != 0) {
+        fprintf(stderr, "Error: Failed to update package database\n");
+        return status;
+    }
+    
+    if (full_upgrade) {
+        printf("Performing full system upgrade...\n");
+        status = system("sudo pacman -Su --noconfirm");
+        if (status != 0) {
+            fprintf(stderr, "Error: Failed to upgrade system\n");
+            return status;
+        }
+        
+        // Check for installed AUR packages
+        printf("Checking for AUR package updates...\n");
+        
+        // Create a simple script to find foreign packages (typically AUR)
+        char tmp_script[MAX_BUFFER];
+        snprintf(tmp_script, MAX_BUFFER, "%saur_packages.sh", TMP_DIR);
+        
+        FILE *fp = fopen(tmp_script, "w");
+        if (fp == NULL) {
+            fprintf(stderr, "Error: Failed to create temporary script\n");
+            return 1;
+        }
+        
+        fprintf(fp, "#!/bin/bash\n");
+        fprintf(fp, "pacman -Qm | cut -d' ' -f1\n");
+        fclose(fp);
+        
+        // Make script executable
+        chmod(tmp_script, 0755);
+        
+        // Execute the script and capture output to process AUR packages
+        FILE *packages = popen(tmp_script, "r");
+        if (packages == NULL) {
+            fprintf(stderr, "Error: Failed to get list of AUR packages\n");
+            return 1;
+        }
+        
+        // Update each AUR package
+        char package_name[256];
+        int aur_updates = 0;
+        while (fgets(package_name, sizeof(package_name), packages) != NULL) {
+            // Remove trailing newline
+            size_t len = strlen(package_name);
+            if (len > 0 && package_name[len - 1] == '\n') {
+                package_name[len - 1] = '\0';
+            }
+            
+            if (strlen(package_name) > 0) {
+                printf("Updating AUR package: %s\n", package_name);
+                status = download_and_build_package(package_name);
+                if (status == 0) {
+                    aur_updates++;
+                }
+            }
+        }
+        
+        pclose(packages);
+        unlink(tmp_script);
+        
+        printf("System upgrade complete: %d AUR package(s) updated\n", aur_updates);
+    }
+    
+    return 0;
+}
+
 void free_package_data(Package *packages, int count) {
     if (packages == NULL) {
         return;
@@ -501,21 +621,23 @@ void print_usage() {
     printf("Options:\n");
     printf("  -S, --sync       Search and install package (default action)\n");
     printf("  -R, --remove     Remove package\n");
+    printf("  -U, --update     Update specific package(s) or system\n");
+    printf("                   Use -Ufull for full system upgrade\n");
     printf("  -h, --help       Show this help message\n");
     printf("\n");
     printf("Examples:\n");
     printf("  methaur firefox     Search for firefox in official repos and AUR\n");
     printf("  methaur -S firefox  Same as above\n");
     printf("  methaur -R firefox  Remove firefox package\n");
+    printf("  methaur -U firefox  Update firefox package\n");
+    printf("  methaur -Ufull      Full system upgrade (packages from repos and AUR)\n");
 }
 
 int main(int argc, char *argv[]) {
     // Initialize curl
     curl_global_init(CURL_GLOBAL_DEFAULT);
     
-  
     create_directories();
-    
     
     if (argc < 2) {
         print_usage();
@@ -525,7 +647,6 @@ int main(int argc, char *argv[]) {
     
     int ret = 0;
     
-   
     if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
         print_usage();
     } else if (strcmp(argv[1], "-R") == 0 || strcmp(argv[1], "--remove") == 0) {
@@ -535,6 +656,15 @@ int main(int argc, char *argv[]) {
         } else {
             ret = remove_package(argv[2]);
         }
+    } else if (strcmp(argv[1], "-U") == 0 || strcmp(argv[1], "--update") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Error: No package specified for update. Use -Ufull for full system upgrade.\n");
+            ret = 1;
+        } else {
+            ret = update_package(argv[2]);
+        }
+    } else if (strcmp(argv[1], "-Ufull") == 0) {
+        ret = update_system(1);
     } else {
         const char *query;
         
@@ -550,7 +680,6 @@ int main(int argc, char *argv[]) {
             query = argv[1];
         }
         
-        
         Package *results = NULL;
         int count = 0;
         
@@ -561,7 +690,6 @@ int main(int argc, char *argv[]) {
             ret = 1;
         } else {
             display_search_results(results, count);
-            
             
             int selection = 0;
             char input[32];
@@ -580,7 +708,6 @@ int main(int argc, char *argv[]) {
             free_package_data(results, count);
         }
     }
-    
     
     curl_global_cleanup();
     
