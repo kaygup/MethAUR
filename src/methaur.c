@@ -6,6 +6,7 @@
 #include <sys/wait.h>
 #include <curl/curl.h>
 #include <json-c/json.h>
+#include <sys/stat.h>
 
 #define MAX_PACKAGES 50
 #define MAX_BUFFER 8192
